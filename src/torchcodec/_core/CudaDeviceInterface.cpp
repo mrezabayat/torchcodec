@@ -10,6 +10,7 @@
 extern "C" {
 #include <libavutil/hwcontext_cuda.h>
 #include <libavutil/pixdesc.h>
+#include <libavutil/pixfmt.h>
 }
 
 namespace facebook::torchcodec {
@@ -225,26 +226,47 @@ void CudaDeviceInterface::convertAVFrameToFrameOutput(
   c10::cuda::CUDAGuard deviceGuard(device_);
 
   NppiSize oSizeROI = {width, height};
-  Npp8u* input[2] = {avFrame->data[0], avFrame->data[1]};
 
   auto start = std::chrono::high_resolution_clock::now();
   NppStatus status;
-  if (avFrame->colorspace == AVColorSpace::AVCOL_SPC_BT709) {
-    status = nppiNV12ToRGB_709CSC_8u_P2C3R(
+
+  AVHWFramesContext* hwFramesCtx =
+      reinterpret_cast<AVHWFramesContext*>(avFrame->hw_frames_ctx->data);
+  auto swFormat = static_cast<AVPixelFormat>(hwFramesCtx->sw_format);
+
+  if (swFormat == AV_PIX_FMT_YUV420P) {
+    Npp8u* input[3] = {avFrame->data[0], avFrame->data[1], avFrame->data[2]};
+    status = nppiYUV420ToRGB_8u_P2C3R(
         input,
         avFrame->linesize[0],
         static_cast<Npp8u*>(dst.data_ptr()),
         dst.stride(0),
         oSizeROI);
+    TORCH_CHECK(status == NPP_SUCCESS, "Failed to convert YUV420P frame.");
+  } else if (swFormat == AV_PIX_FMT_NV12) {
+    Npp8u* input[2] = {avFrame->data[0], avFrame->data[1]};
+    if (avFrame->colorspace == AVColorSpace::AVCOL_SPC_BT709) {
+      status = nppiNV12ToRGB_709CSC_8u_P2C3R(
+          input,
+          avFrame->linesize[0],
+          static_cast<Npp8u*>(dst.data_ptr()),
+          dst.stride(0),
+          oSizeROI);
+    } else {
+      status = nppiNV12ToRGB_8u_P2C3R(
+          input,
+          avFrame->linesize[0],
+          static_cast<Npp8u*>(dst.data_ptr()),
+          dst.stride(0),
+          oSizeROI);
+    }
+    TORCH_CHECK(status == NPP_SUCCESS, "Failed to convert NV12 frame.");
   } else {
-    status = nppiNV12ToRGB_8u_P2C3R(
-        input,
-        avFrame->linesize[0],
-        static_cast<Npp8u*>(dst.data_ptr()),
-        dst.stride(0),
-        oSizeROI);
+    TORCH_CHECK(
+        false,
+        "Unsupported pixel format: ",
+        av_get_pix_fmt_name(swFormat));
   }
-  TORCH_CHECK(status == NPP_SUCCESS, "Failed to convert NV12 frame.");
 
   // Make the pytorch stream wait for the npp kernel to finish before using the
   // output.
