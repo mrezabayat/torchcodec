@@ -8,6 +8,7 @@
 #include "src/torchcodec/_core/FFMPEGCommon.h"
 
 extern "C" {
+#include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_cuda.h>
 #include <libavutil/pixdesc.h>
 }
@@ -312,27 +313,35 @@ void CudaDeviceInterface::convertAVFrameToFrameOutput(
       static_cast<int>(getFFMPEGCompatibleDeviceIndex(device_)));
 
   NppiSize oSizeROI = {width, height};
-  Npp8u* input[2] = {avFrame->data[0], avFrame->data[1]};
-
+  TORCH_CHECK(avFrame->hw_frames_ctx, "Expected AVFrame to have hw_frames_ctx");
+  const AVHWFramesContext* framesCtx =
+      reinterpret_cast<AVHWFramesContext*>(avFrame->hw_frames_ctx->data);
+  AVPixelFormat swFormat = framesCtx->sw_format;
+  
   NppStatus status;
-
-  if (avFrame->colorspace == AVColorSpace::AVCOL_SPC_BT709) {
-    status = nppiNV12ToRGB_709CSC_8u_P2C3R_Ctx(
-        input,
-        avFrame->linesize[0],
-        static_cast<Npp8u*>(dst.data_ptr()),
-        dst.stride(0),
-        oSizeROI,
-        nppCtx);
-  } else {
+  if (swFormat == AV_PIX_FMT_YUV420P) {
+    Npp8u* input[3] = {avFrame->data[0], avFrame->data[1], avFrame->data[2]};
+    int srcStep[3] = {avFrame->linesize[0], avFrame->linesize[1], avFrame->linesize[2]};
+    status = nppiYUV420ToRGB_8u_P3C3R_Ctx(
+      input,
+      srcStep,
+      static_cast<Npp8u*>(dst.data_ptr()),
+      dst.stride(0),
+      oSizeROI,
+      nppCtx);
+  } else if (swFormat == AV_PIX_FMT_NV12) {
+    Npp8u* input[2] = {avFrame->data[0], avFrame->data[1]};
     status = nppiNV12ToRGB_8u_P2C3R_Ctx(
-        input,
-        avFrame->linesize[0],
-        static_cast<Npp8u*>(dst.data_ptr()),
-        dst.stride(0),
-        oSizeROI,
-        nppCtx);
+      input,
+      avFrame->linesize[0],
+      static_cast<Npp8u*>(dst.data_ptr()),
+      dst.stride(0),
+      oSizeROI,
+      nppCtx);
+  } else {
+    TORCH_CHECK(false, "Unsupported pixel format: ", av_get_pix_fmt_name(swFormat));
   }
+  
   TORCH_CHECK(status == NPP_SUCCESS, "Failed to convert NV12 frame.");
 }
 
